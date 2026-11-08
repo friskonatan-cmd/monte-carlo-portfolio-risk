@@ -1,4 +1,4 @@
-# Learn Monte Carlo portfolio risk
+# VAR & ES estimator 
 
 The question: **If I start with $10,000 spread across five stocks, what range of values could my portfolio have after 21 trading days, under a model fitted to historical data?**
 
