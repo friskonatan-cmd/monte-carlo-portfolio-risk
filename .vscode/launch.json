@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [{
+    "name": "Run portfolio risk (saved data)",
+    "type": "debugpy",
+    "request": "launch",
+    "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+    "program": "${workspaceFolder}/portfolio_risk.py",
+    "args": ["--cached"],
+    "console": "internalConsole"
+  }]
+}
