@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from risk_engine import (simulate_terminal, historical_terminal, risk,
+                         monte_carlo_intervals)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -75,28 +77,22 @@ def simulate(mu, sigma, correlation, weights, shocks, initial):
     return np.column_stack([np.full(len(shocks), initial), values])
 
 
-def risk(values, initial, confidence=.95):
-    """4. Positive numbers denote losses. Negative VaR is possible; no clipping."""
-    losses = initial - np.asarray(values)
-    var = float(np.quantile(losses, confidence))
-    es = float(losses[losses >= var].mean())
-    return {'VaR_95_dollars': var, 'ES_95_dollars': es,
-            'VaR_95_fraction': var/initial, 'ES_95_fraction': es/initial,
-            'mean_return': float(np.mean(values)/initial-1),
-            'loss_probability': float(np.mean(losses > 0))}
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tickers', nargs='+', default=['AAPL', 'MSFT', 'JPM', 'JNJ', 'XOM'])
     parser.add_argument('--start', default='2023-01-01')
     parser.add_argument('--end', default='2026-01-01', help='Exclusive; fixed completed historical period.')
-    parser.add_argument('--paths', type=int, default=10000)
+    parser.add_argument('--paths', type=int, default=20000)
     parser.add_argument('--days', type=int, default=21)
-    parser.add_argument('--initial', type=float, default=10000)
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--initial', type=float, default=20000)
+    parser.add_argument('--seed', type=int, default=10)
     parser.add_argument('--weights', nargs='+', type=float)
     parser.add_argument('--cached', action='store_true')
+    parser.add_argument('--confidence', type=float, default=.95)
+    parser.add_argument('--resamples', type=int, default=200, help='MC interval resamples; 0 disables.')
+    parser.add_argument('--compare-historical', action='store_true')
+    parser.add_argument('--block-days', type=int, default=5)
+    parser.add_argument('--output', type=Path, default=ROOT/'results')
     args = parser.parse_args()
     args.tickers = [t.upper() for t in args.tickers]
     n = len(args.tickers)
@@ -104,40 +100,60 @@ def main():
         parser.error('Choose 3–5 distinct tickers.')
     if args.paths < 1000 or args.days < 1 or not np.isfinite(args.initial) or args.initial <= 0:
         parser.error('Use at least 1000 paths, a positive horizon, and positive initial value.')
-    # Default portfolio: equal weights (20% each for five stocks).
-    default_weights = [1/n]*n
-    weights = np.asarray(args.weights if args.weights else default_weights)
+    if not 0 < args.confidence < 1 or args.seed < 0:
+        parser.error('Confidence must be between 0 and 1; seed must be nonnegative.')
+    if args.resamples != 0 and args.resamples < 100:
+        parser.error('Use at least 100 interval resamples, or 0 to disable.')
+    if args.compare_historical and not 1 <= args.block_days <= args.days:
+        parser.error('Historical block length must be between 1 and --days.')
+    weights = np.asarray(args.weights if args.weights else [1/n]*n)
     if len(weights) != n or not np.isfinite(weights).all() or (weights < 0).any() or not np.isclose(weights.sum(), 1):
         parser.error('Provide one nonnegative weight per ticker, summing to 1.')
+    weights = weights/weights.sum()
     prices, cache = load_prices(args.tickers, args.start, args.end, args.cached)
     logs, stats = estimate(prices)
     mu, sigma = logs.mean().to_numpy(), logs.std(ddof=1).to_numpy()
     corr = logs.corr().to_numpy()
-    output = ROOT / 'results'
-    output.mkdir(exist_ok=True)
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
     stats.to_csv(output / 'parameters.csv')
     logs.to_csv(output / 'daily_log_returns.csv')
     logs.corr().to_csv(output / 'correlation.csv')
-    rng = np.random.default_rng(args.seed)
-    shocks = rng.standard_normal((args.paths, args.days, n))
+    # Separate streams keep optional features from changing baseline estimates.
+    streams = [np.random.default_rng(s) for s in np.random.SeedSequence(args.seed).spawn(5)]
+    shocks = streams[0].standard_normal((args.paths, n))
     rows = []
     for strength in [0, .25, .5, .75, .95]:
         stressed = stress_correlation(corr, strength)
-        values = simulate(mu, sigma, stressed, weights, shocks, args.initial)
-        metrics = risk(values[:, -1], args.initial)
+        values = simulate_terminal(mu, sigma, stressed, weights, shocks, args.initial, args.days)
+        metrics = risk(values, args.initial, args.confidence)
         rows.append({'stress_strength': strength,
                      'mean_pairwise_correlation': stressed[np.triu_indices(n, 1)].mean(), **metrics})
         if strength == 0:
             baseline = values
+    example_paths = simulate(mu, sigma, stress_correlation(corr, 0), weights,
+                             streams[1].standard_normal((100, args.days, n)), args.initial)
+    models = [{'model':'Gaussian log returns', **risk(baseline, args.initial, args.confidence)}]
+    if args.resamples:
+        models[0].update(monte_carlo_intervals(baseline, args.initial, args.confidence, streams[2], args.resamples))
+    if args.compare_historical:
+        historical = historical_terminal(logs.to_numpy(), weights, args.paths, args.days,
+                                         args.initial, streams[3], args.block_days)
+        model = {'model':f'Historical blocks ({args.block_days} days)', **risk(historical, args.initial, args.confidence)}
+        if args.resamples:
+            model.update(monte_carlo_intervals(historical, args.initial, args.confidence, streams[4], args.resamples))
+        models.append(model)
+    pd.DataFrame(models).to_csv(output/'model_comparison.csv', index=False)
     table = pd.DataFrame(rows)
     table.to_csv(output / 'sensitivity.csv', index=False)
-    pd.DataFrame({'ending_value':baseline[:,-1], 'return':baseline[:,-1]/args.initial-1,
-                  'loss':args.initial-baseline[:,-1]}).to_csv(output / 'simulated_outcomes.csv', index=False)
-    pd.DataFrame(baseline[:100].T).to_csv(output / 'example_paths.csv', index_label='day')
-    metadata = {**vars(args), 'weights': weights.tolist(), 'price_file': str(cache),
+    pd.DataFrame({'ending_value':baseline, 'return':baseline/args.initial-1,
+                  'loss':args.initial-baseline}).to_csv(output / 'simulated_outcomes.csv', index=False)
+    pd.DataFrame(example_paths.T).to_csv(output / 'example_paths.csv', index_label='day')
+    metadata = {**vars(args), 'output':output.name, 'weights': weights.tolist(), 'price_file': cache.name,
                 'first_observation':str(prices.index[0].date()), 'last_observation':str(prices.index[-1].date()),
                 'model':'IID multivariate normal daily log returns; buy and hold adjusted-price growth',
-                'correlation_shrinkage':1e-8}
+                'correlation_shrinkage':1e-8, 'sampler':'direct terminal normal v2',
+                'VaR_method':'empirical inverse CDF', 'ES_method':'exact empirical upper-tail mass'}
     (output/'settings.json').write_text(json.dumps(metadata, indent=2))
     b=rows[0]
     report = f'''# Portfolio risk experiment
@@ -147,8 +163,8 @@ Tickers: {', '.join(args.tickers)}. Starting weights: {weights.tolist()}.
 Initial value: ${args.initial:,.2f}. Horizon: {args.days} trading days. Paths: {args.paths:,}. Seed: {args.seed}.
 
 ## Baseline model estimates
-- 95% VaR: ${b['VaR_95_dollars']:,.2f} ({b['VaR_95_fraction']:.2%}). Roughly 5% of modeled losses exceed this threshold.
-- 95% Expected Shortfall: ${b['ES_95_dollars']:,.2f} ({b['ES_95_fraction']:.2%}). Average loss in the worst 5% tail (including ties).
+- {args.confidence:.1%} VaR: ${b['VaR_dollars']:,.2f} ({b['VaR_fraction']:.2%}). Roughly {1-args.confidence:.1%} of modeled losses exceed this threshold.
+- {args.confidence:.1%} Expected Shortfall: ${b['ES_dollars']:,.2f} ({b['ES_fraction']:.2%}). Average of the worst {1-args.confidence:.1%} probability mass, fractionally weighting the boundary.
 - Mean simulated return: {b['mean_return']:.2%}.
 - Fraction of simulated outcomes below the starting value: {b['loss_probability']:.2%}.
 
@@ -158,11 +174,24 @@ Stress strength moves correlations towards +1; it is not the correlation itself.
 
 '''
     for row in rows:
-        report += f"- Stress {row['stress_strength']:.0%}: mean correlation {row['mean_pairwise_correlation']:.3f}, VaR ${row['VaR_95_dollars']:,.2f}, ES ${row['ES_95_dollars']:,.2f}.\n"
+        report += f"- Stress {row['stress_strength']:.0%}: mean correlation {row['mean_pairwise_correlation']:.3f}, VaR ${row['VaR_dollars']:,.2f}, ES ${row['ES_dollars']:,.2f}.\n"
+    report += '\n## Model comparison and Monte Carlo precision\n'
+    for model in models:
+        report += f"- {model['model']}: VaR ${model['VaR_dollars']:,.2f}, ES ${model['ES_dollars']:,.2f}.\n"
+        if args.resamples:
+            report += f"  Approximate 95% MC intervals: VaR [${model['VaR_mc_low']:,.2f}, ${model['VaR_mc_high']:,.2f}]; ES [${model['ES_mc_low']:,.2f}, ${model['ES_mc_high']:,.2f}].\n"
+    if args.resamples:
+        report += f'Intervals use {args.resamples} percentile-bootstrap resamples of simulated outcomes. They measure simulation noise ONLY, not historical-parameter uncertainty or real-market loss bounds.\n'
+    if args.compare_historical:
+        report += 'Historical blocks retain joint observed returns and within-block time order. Block boundaries break time dependence; block length is a modeling choice. This cannot generate unseen daily shocks. A higher ES does not establish a more accurate model.\n'
+    report += f"Effective tail observations: {b['tail_observations_equivalent']:.1f}.\n"
+    if b['tail_observations_equivalent'] < 100:
+        report += 'CAUTION: Fewer than 100 effective tail observations; increase --paths for more stable estimates.\n'
     report += '''
 ## Assumptions and limits
 These are conditional model estimates, not forecasts or maximum losses. No out-of-sample validation is claimed.
-Daily log returns are independent over time with constant means, volatilities, and correlations; extreme moves and volatility clustering can be understated.
+The Gaussian model assumes independent daily log returns with constant means, volatilities, and correlations; extreme moves and volatility clustering can be understated.
+The terminal shortcut preserves that model's distribution but uses different random draws from the old daily-path sampler, so the same seed need not reproduce old estimates. VaR now uses the empirical inverse CDF.
 Estimated means are noisy; results depend on the historical window and selected surviving stocks.
 Adjusted prices approximate reinvested distributions, not raw executable share prices. No tax, fees, rebalancing, or market impact is modeled.
 Annualized mean simple returns are arithmetic summaries, not realized compound annual growth rates.
@@ -170,22 +199,22 @@ Increasing positive correlations reduces diversification in this long-only model
 Finite simulation results contain sampling noise. Repeat with different seeds and more paths before interpreting small differences.
 '''
     (output/'REPORT.md').write_text(report, encoding='utf-8')
-    plot(baseline, corr, table, args, output)
+    plot(example_paths, baseline, corr, table, args, output, models)
     print(report)
     print(f'Results saved to {output}')
 
 
-def plot(values, corr, table, args, output):
+def plot(values, terminal, corr, table, args, output, models):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(2, 2, figsize=(12, 8))
     ax[0,0].plot(values[:100].T, alpha=.18, linewidth=.8)
-    ax[0,0].set(title='100 illustrative portfolio paths', xlabel='Trading day', ylabel='Portfolio value ($)')
-    losses = args.initial-values[:,-1]
+    ax[0,0].set(title='100 independent illustrative paths', xlabel='Trading day', ylabel='Portfolio value ($)')
+    losses = args.initial-terminal
     ax[0,1].hist(losses, bins=60, color='#187e91', alpha=.8)
     for label, col in [('VaR','#d04b36'),('ES','#723fa0')]:
-        ax[0,1].axvline(table.iloc[0][f'{label}_95_dollars'], color=col, label=f'95% {label}')
+        ax[0,1].axvline(table.iloc[0][f'{label}_dollars'], color=col, label=f'{args.confidence:.1%} {label}')
     ax[0,1].set(title='Simulated ending losses (negative = gain)', xlabel='Loss ($)', ylabel='Number of paths')
     ax[0,1].legend()
     im=ax[1,0].imshow(corr, vmin=-1, vmax=1, cmap='RdBu_r')
@@ -197,15 +226,27 @@ def plot(values, corr, table, args, output):
             ax[1,0].text(j,i,f'{corr[i,j]:.2f}',ha='center',va='center',color='white' if abs(corr[i,j])>.65 else 'black')
     fig.colorbar(im, ax=ax[1,0], shrink=.8)
     for label in ['VaR','ES']:
-        ax[1,1].plot(table['mean_pairwise_correlation'],table[f'{label}_95_dollars'],marker='o',label=label)
-    ax[1,1].set(title='Sensitivity: correlations stressed towards +1',xlabel='Mean pairwise correlation',ylabel='95% loss measure ($)')
+        ax[1,1].plot(table['mean_pairwise_correlation'],table[f'{label}_dollars'],marker='o',label=label)
+    ax[1,1].set(title='Sensitivity: correlations stressed towards +1',xlabel='Mean pairwise correlation',ylabel=f'{args.confidence:.1%} loss measure ($)')
     ax[1,1].legend()
-    fig.suptitle(f'Portfolio risk | {args.paths:,} paths | {args.days} trading days',fontsize=16)
+    fig.suptitle(f'Portfolio risk | {args.paths:,} terminal simulations | {args.days} trading days',fontsize=16)
     fig.tight_layout()
     fig.savefig(output/'dashboard.png',dpi=160)
+    plt.close(fig)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    for axis, metric in zip(axes, ['VaR', 'ES']):
+        for i, model in enumerate(models):
+            axis.scatter(i, model[f'{metric}_dollars'], s=60)
+            if f'{metric}_mc_low' in model:
+                axis.vlines(i, model[f'{metric}_mc_low'], model[f'{metric}_mc_high'], linewidth=2)
+        axis.set_xticks(range(len(models)), [m['model'] for m in models], fontsize=9)
+        axis.set(title=f'{args.confidence:.1%} {metric}', ylabel='Loss ($)', xlim=(-.5, len(models)-.5))
+    title = ('Approximate 95% intervals show Monte Carlo noise only\nModel and historical-parameter uncertainty are excluded'
+             if args.resamples else 'Model comparison | Monte Carlo intervals disabled')
+    fig.suptitle(title, fontsize=11)
+    fig.savefig(output/'model_comparison.png', dpi=160)
     plt.close(fig)
 
 
 if __name__ == '__main__':
     main()
-
